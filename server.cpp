@@ -5,14 +5,18 @@
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
-#include<vector>
+#include <vector>
+#include <map>
+#include<string>
 
 #include <iostream>
+
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -76,13 +80,14 @@ static void conn_put(std::vector<Conn *>& fd2conn, struct Conn *conn){
     fd2conn[conn->fd] = conn;
 }
 
-static int32_t accept_new_conn(std::vector<Conn *>&fd2conn, int fd){
+static int accept_new_conn(std::vector<Conn *>&fd2conn, int fd){
     struct sockaddr_in client_addr = {};
     socklen_t socklen = sizeof(client_addr);
-    int connfd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
 
+    int connfd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
     if(connfd < 0){
         msg("accept() error");
+        std::cout << errno << std::endl;
         return -1;
     }
 
@@ -100,12 +105,117 @@ static int32_t accept_new_conn(std::vector<Conn *>&fd2conn, int fd){
     conn -> wbuf_size = 0;
     conn->wbuf_sent = 0;
     conn_put(fd2conn,conn);
-    return 0;
+    return conn->fd;
 
 }
 
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
+
+const size_t K_MAX_ARGS = 1024;
+
+
+static int32_t parse_req(
+    const uint8_t *data, size_t len, std::vector<std::string> &out){
+
+    if(len < 4) {
+        return -1;
+    }
+     uint32_t n = 0;
+     memcpy(&n, &data[0], 4);
+     if(n > K_MAX_ARGS) {
+        return -1;
+     }
+
+     size_t pos = 4;
+     while(n--){
+        if (pos+4 > len) {
+            return -1;
+        }
+        uint32_t sz = 0;
+        memcpy(&sz, &data[pos],4);
+        if(pos + 4 + sz > len) {
+            return -1;
+        }
+        out.push_back(std::string((char *)&data[pos+4], sz));
+        pos += 4 + sz;
+     }
+     if(pos != len){
+        return -1;
+     }
+     return 0;
+}
+
+enum {
+    RES_OK = 0,
+    RES_ERR = 1,
+    RES_NX = 2
+};
+
+static std::map<std::string, std::string> g_map;
+
+static uint32_t do_get(
+    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    if(!g_map.count(cmd[1])) {
+        return RES_NX;
+    }
+    std::string &val = g_map[cmd[1]];
+    assert(val.size() <= K_MAX_MSG);
+    memcpy(res,val.data(), val.size());
+    *reslen = (uint32_t)val.size();
+
+    return RES_OK;
+}
+
+static uint32_t do_set(
+    const std::vector<std::string> & cmd, uint8_t *res, uint32_t *reslen)
+    {
+        (void)res;
+        (void)reslen;
+        g_map[cmd[1]] = cmd[2];
+        return RES_OK;
+    }
+
+static uint32_t do_del(
+    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
+{
+    (void)res;
+    (void)reslen;
+    g_map.erase(cmd[1]);
+    return RES_OK;
+}
+
+static bool cmd_is(const std::string&word, const char *cmd){
+    return 0 == strcasecmp(word.c_str(), cmd);
+}
+
+static int32_t do_request(
+    const uint8_t *req, uint32_t reqlen,
+    uint32_t *rescode, uint8_t *res, uint32_t *reslen){
+
+    std::vector<std::string> cmd;
+    if(0 != parse_req(req, reqlen, cmd)) {
+        msg("bad req");
+        return -1;
+    }
+
+    if (cmd.size()  == 2 && cmd_is(cmd[0], "get")) {
+        *rescode = do_get(cmd,res,reslen);
+    }else if (cmd.size() == 3 && cmd_is(cmd[0],"set")) {
+        *rescode = do_set(cmd, res, reslen);
+    } else if (cmd.size() == 2 && cmd_is(cmd[0],"del")) {
+        *rescode = do_del(cmd, res, reslen);
+    } else {
+        *rescode = RES_ERR;
+        const char *msg = "Unknown cmd";
+        strcpy((char *)res, msg);
+        *reslen = strlen(msg);
+        return 0;
+    }
+    return 0;
+    
+}
 
 
 static bool try_one_request(Conn *conn) {
@@ -114,7 +224,7 @@ static bool try_one_request(Conn *conn) {
     }
     uint32_t len = 0;
     memcpy(&len, &conn->rbuf[0], 4);
-    if (len > k_max_msg) {
+    if (len > K_MAX_MSG) {
         msg("too long");
         conn->state = STATE_END;
         return false;
@@ -126,7 +236,7 @@ static bool try_one_request(Conn *conn) {
 
     uint32_t rescode = 0;
     uint32_t wlen = 0;
-    int32_t do_request(
+    int32_t err = do_request(
         &conn->rbuf[4], len,
         &rescode, &conn->wbuf[4+4],&wlen
         );
@@ -158,7 +268,6 @@ static bool try_one_request(Conn *conn) {
 static bool try_fill_buffer(Conn *conn) {
     assert(conn->rbuf_size < sizeof(conn->rbuf));
     ssize_t rv = 0;
-    memcpy()
     do{
         size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
 
@@ -193,9 +302,6 @@ static void state_req(Conn *conn) {
     while(try_fill_buffer(conn)){}
 }
 
-
-
-
 static bool try_flush_buffer(Conn*conn) {
     ssize_t rv = 0;
     do {
@@ -220,107 +326,8 @@ static bool try_flush_buffer(Conn*conn) {
     return true;
 }
 
-enum {
-    RES_OK = 0,
-    RES_ERR = 1,
-    RES_NX = 2
-};
-
-static std::map<std::string, std:string> g_map;
-
-static uint32_t do_get(
-    const std::vector<std::string> &cmd uint8_t *res, uint32_t *reslen)
-{
-    if(!g_map.count(cmd[1])) {
-        return RES_NX;
-    }
-    std::string &val = g_map[cmd[1]];
-    assert(val.size() <= K_MAX_MSG);
-    memcpy(res,val.data(), val.size());
-    *reslen = (uint32_t)val.size();
-
-    return RES_OK;
-}
-
-static uint32_t do_set(
-    const std::vector<std::string> & cmd, uint8_t *res, uint32_t *reslen)
-    {
-        (void)res;
-        (void)reslen;
-        g_map[cmd[1]] = cmd[2];
-        return RES_OK;
-    }
-
-static uint32_t do_del(
-    const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen)
-{
-    (void)res;
-    (void)reslen;
-    g_map.erase(cmd[1]);
-    return RES_OK;
-}
-const size_t K_MAX_ARGS = 1024;
-static int32_t parse_req(
-    const uint8_t *data, size_t len, std::vector<std::string> &out){
-
-    if(len < 4) {
-        return -1;
-    }
-     uint32_t n = 0;
-     memcpy(&n, *data[0], 4);
-     if(n > K_MAX_ARGS) {
-        return -1;
-     }
-
-     size_t pos = 4;
-     while(n--){
-        if (pos+4 > len) {
-            return -1;
-        }
-        uint32_t sz = 0;
-        memcpy(&sz, &data[pos],4);
-        if(pos + 4 + sz > len) {
-            return -1;
-        }
-        out.push_back(std::string((char *)&data[pos+4], sz));
-        pos += 4 + sz;
-     }
-     if(pos != len){
-        return -1;
-     }
-     return 0;
-}
-
-
 static void state_res(Conn *conn) {
     while(try_flush_buffer(conn)){}
-}
-
-static int32_t do_request(
-    const uint32_t *req, uint32_t reqlen,
-    uint32_t *rescode,uint8_t, uint32_t *reslen){
-
-    std::vector<std::string> cmd;
-    if(0 != parse_req(req, reqlen, cmd)) {
-        msg("bad req");
-        return -1;
-    }
-
-    if (cmd.size()  == 2 && cmd_is(cmd[0], "get")) {
-        *rescode = do_get(cmd,red,reslen);
-    }else if (cmd.size() == 3 && cmd_is(cmd[0],"set")) {
-        *rescode = do_set(cmd, res, reslen);
-    } else if (cmd.size() == 2 && cmd_is(cmd[0],"del")) {
-        *rescode = do_del(cmd, res, reslen);
-    } else {
-        *rescode = RES_ERR;
-        const char *msg = "Unknown cmd";
-        strcpy((char *)res, msg);
-        *reslen = strlen(msg);
-        return 0;
-    }
-    return 0;
-    
 }
 
 
@@ -341,7 +348,6 @@ int main()
     if (fd < 0) {
         die("socket()");
     }
-    // bind, this is the syntax that deals with IPv4 addresses
     int val = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
@@ -354,78 +360,79 @@ int main()
     if (rv) {
         die("bind()");
     }
-
     // listen
     rv = listen(fd, SOMAXCONN);
     if (rv) {
         die("listen()");
     }
 
+    fd_set_nb(fd);
 
     //A map of all client connections, keyed by fd
     std::vector<Conn *> fd2conn;
 
-    fd_set_nb(fd);  
-    std::vector<epoll_event> epoll_events;
+    epoll_event events[64];
+    
 
-    while(true){
-        
-        epoll_events.clear();
+    int epfd = epoll_create1(0);
+    if(epfd < 0){
+        die("epoll_create1()");
+    }
+    struct epoll_event epe = {};
+    epe.data.fd = fd;
+    epe.events = EPOLLIN;
 
-        int epoll_fd = epoll_create(0);
+    rv = epoll_ctl(epfd,EPOLL_CTL_ADD, fd, &epe);
 
+    if (rv < 0){
+        msg("epoll_ctl()");
+    }
 
-        if(epoll_fd){
-            die("epoll_createl()");
-        }
+    while (true){
+        size_t event_total = epoll_wait(epfd,events,64,1000);
 
-        struct epoll_event efd;
-
-
-        efd.events = EPOLLIN;
-        efd.data.fd = fd;
-
-        int rv = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &efd);
-        if(rv<0){
-            die("epoll_ctl()");
-        }
-        epoll_events.push_back(efd);
-        for(Conn* conn : fd2conn){
-            if(!conn) {
-                continue;
-            }
-            struct epoll_event efd = {};
-            efd.data.fd = conn->fd;
-            efd.events = (conn->state == STATE_REQ) ? EPOLLIN : EPOLLOUT;
-            efd.events = efd.events | EPOLLERR; 
-            int rv = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &efd);
-            if(rv<0){
-                die("epoll_ctl()");
-            }
-            epoll_events.push_back(efd);
-        }
-
-        size_t event_count = epoll_wait(fd, epoll_events.data(),(int)epoll_events.size(),1000);
-        if(rv < 0){
+        if(rv == -1){
             die("epoll_wait()");
         }
 
-        for(size_t i = 1; i < event_count; ++i){
-            if(epoll_events[i].events) {
-                Conn *conn = fd2conn[epoll_events[i].data.fd];
+        size_t size = 0;
+        if (event_total && events[0].data.fd == fd) {
+            int nfd = accept_new_conn(fd2conn, fd);
+            struct epoll_event epe = {};
+            epe.data.fd = nfd;
+            epe.events = EPOLLIN;
+            rv = epoll_ctl(epfd,EPOLL_CTL_ADD, nfd, &epe);
+
+            if (rv < 0){
+                msg("epoll_ctl()");
+            }
+
+            size+=1;
+        }
+
+
+        for (size_t i = size; i < event_total; ++i) {
+            events[i].events = (fd2conn[events[i].data.fd]->state == STATE_REQ) ? EPOLLIN : EPOLLOUT;
+            events[i].events = events[i].events | EPOLLERR;
+            if (events[i].events) {
+                Conn *conn = fd2conn[events[i].data.fd];
                 connection_io(conn);
-                if(conn->state == STATE_END) {
+                if (conn->state == STATE_END) {
+                    // client closed normally, or something bad happened.
+                    // destroy this connection
                     fd2conn[conn->fd] = NULL;
                     (void)close(conn->fd);
                     free(conn);
                 }
             }
         }
-        if(epoll_events[0].events) {
-            (void)accept_new_conn(fd2conn,fd);
-        }
+
+        // try to accept a new connection if the listening fd is active
+        
     }
 
     return 0;
+
 }
+
 
